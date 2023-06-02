@@ -213,6 +213,7 @@ var ServerFlags = []cli.Flag{
 		Destination: &ServerConfig.FlannelBackend,
 		Value:       "vxlan",
 	},
+	&cli.BoolFlag{
 		Name:        "multi-cluster-cidr",
 		Usage:       "(experimental/networking) Enable multiClusterCIDR",
 		Destination: &ServerConfig.MultiClusterCIDR,
@@ -503,6 +504,7 @@ var ServerFlags = []cli.Flag{
 	ExtraKubeletArgs,
 	ExtraKubeProxyArgs,
 	ProtectKernelDefaultsFlag,
+	&cli.BoolFlag{
 		Name:        "secrets-encryption",
 		Usage:       "Enable secret encryption at rest",
 		Destination: &ServerConfig.EncryptSecrets,
