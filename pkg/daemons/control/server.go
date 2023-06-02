@@ -21,9 +21,6 @@ import (
 	"github.com/sirupsen/logrus"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
-	authorizationv1client "k8s.io/client-go/kubernetes/typed/authorization/v1"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes"
 	proxyutil "k8s.io/kubernetes/pkg/proxy/util"
 
@@ -93,11 +90,12 @@ func Server(ctx context.Context, cfg *config.Control) error {
 func controllerManager(ctx context.Context, cfg *config.Control) error {
 	runtime := cfg.Runtime
 	argsMap := map[string]string{
+		"controllers":                      "*,tokencleaner",
 		"feature-gates":                    "JobTrackingWithFinalizers=true",
 		"kubeconfig":                       runtime.KubeConfigController,
 		"authorization-kubeconfig":         runtime.KubeConfigController,
 		"authentication-kubeconfig":        runtime.KubeConfigController,
-		"service-account-private-key-file": runtime.ServiceKey,
+		"service-account-private-key-file": runtime.ServiceCurrentKey,
 		"allocate-node-cidrs":              "true",
 		"service-cluster-ip-range":         util.JoinIPNets(cfg.ServiceIPRanges),
 		"cluster-cidr":                     util.JoinIPNets(cfg.ClusterIPRanges),
@@ -106,21 +104,25 @@ func controllerManager(ctx context.Context, cfg *config.Control) error {
 		"bind-address":                     cfg.Loopback(false),
 		"secure-port":                      "10257",
 		"use-service-account-credentials":  "true",
-		"cluster-signing-kube-apiserver-client-cert-file": runtime.ClientCA,
+		"cluster-signing-kube-apiserver-client-cert-file": runtime.SigningClientCA,
 		"cluster-signing-kube-apiserver-client-key-file":  runtime.ClientCAKey,
-		"cluster-signing-kubelet-client-cert-file":        runtime.ClientCA,
+		"cluster-signing-kubelet-client-cert-file":        runtime.SigningClientCA,
 		"cluster-signing-kubelet-client-key-file":         runtime.ClientCAKey,
-		"cluster-signing-kubelet-serving-cert-file":       runtime.ServerCA,
+		"cluster-signing-kubelet-serving-cert-file":       runtime.SigningServerCA,
 		"cluster-signing-kubelet-serving-key-file":        runtime.ServerCAKey,
-		"cluster-signing-legacy-unknown-cert-file":        runtime.ServerCA,
+		"cluster-signing-legacy-unknown-cert-file":        runtime.SigningServerCA,
 		"cluster-signing-legacy-unknown-key-file":         runtime.ServerCAKey,
+	}
+	if cfg.MultiClusterCIDR {
+		argsMap["cidr-allocator-type"] = "MultiCIDRRangeAllocator"
+		argsMap["feature-gates"] = util.AddFeatureGate(argsMap["feature-gates"], "MultiCIDRRangeAllocator=true")
 	}
 	if cfg.NoLeaderElect {
 		argsMap["leader-elect"] = "false"
 	}
 	if !cfg.DisableCCM {
 		argsMap["configure-cloud-routes"] = "false"
-		argsMap["controllers"] = "*,-service,-route,-cloud-node-lifecycle"
+		argsMap["controllers"] = argsMap["controllers"] + ",-service,-route,-cloud-node-lifecycle"
 	}
 
 	args := config.GetArgs(argsMap, cfg.ExtraControllerArgs)
@@ -161,8 +163,9 @@ func apiServer(ctx context.Context, cfg *config.Control) error {
 
 	argsMap["cert-dir"] = certDir
 	argsMap["allow-privileged"] = "true"
+	argsMap["enable-bootstrap-token-auth"] = "true"
 	argsMap["authorization-mode"] = strings.Join([]string{modes.ModeNode, modes.ModeRBAC}, ",")
-	argsMap["service-account-signing-key-file"] = runtime.ServiceKey
+	argsMap["service-account-signing-key-file"] = runtime.ServiceCurrentKey
 	argsMap["service-cluster-ip-range"] = util.JoinIPNets(cfg.ServiceIPRanges)
 	argsMap["service-node-port-range"] = cfg.ServiceNodePortRange.String()
 	argsMap["advertise-port"] = strconv.Itoa(cfg.AdvertisePort)
@@ -185,7 +188,11 @@ func apiServer(ctx context.Context, cfg *config.Control) error {
 	argsMap["kubelet-certificate-authority"] = runtime.ServerCA
 	argsMap["kubelet-client-certificate"] = runtime.ClientKubeAPICert
 	argsMap["kubelet-client-key"] = runtime.ClientKubeAPIKey
-	argsMap["kubelet-preferred-address-types"] = "InternalIP,ExternalIP,Hostname"
+	if cfg.FlannelExternalIP {
+		argsMap["kubelet-preferred-address-types"] = "ExternalIP,InternalIP,Hostname"
+	} else {
+		argsMap["kubelet-preferred-address-types"] = "InternalIP,ExternalIP,Hostname"
+	}
 	argsMap["requestheader-client-ca-file"] = runtime.RequestHeaderCA
 	argsMap["requestheader-allowed-names"] = deps.RequestHeaderCN
 	argsMap["proxy-client-cert-file"] = runtime.ClientAuthProxyCert
@@ -197,6 +204,10 @@ func apiServer(ctx context.Context, cfg *config.Control) error {
 	argsMap["enable-admission-plugins"] = "NodeRestriction"
 	argsMap["anonymous-auth"] = "false"
 	argsMap["profiling"] = "false"
+	if cfg.MultiClusterCIDR {
+		argsMap["feature-gates"] = util.AddFeatureGate(argsMap["feature-gates"], "MultiCIDRRangeAllocator=true")
+		argsMap["runtime-config"] = "networking.k8s.io/v1alpha1"
+	}
 	if cfg.EncryptSecrets {
 		argsMap["encryption-provider-config"] = runtime.EncryptionConfig
 	}
@@ -318,6 +329,11 @@ func cloudControllerManager(ctx context.Context, cfg *config.Control) error {
 	}
 	if cfg.DisableCCM {
 		argsMap["controllers"] = argsMap["controllers"] + ",-cloud-node,-cloud-node-lifecycle"
+		argsMap["secure-port"] = "0"
+	}
+	if cfg.MultiClusterCIDR {
+		argsMap["cidr-allocator-type"] = "MultiCIDRRangeAllocator"
+		argsMap["feature-gates"] = util.AddFeatureGate(argsMap["feature-gates"], "MultiCIDRRangeAllocator=true")
 	}
 	if cfg.DisableServiceLB {
 		argsMap["controllers"] = argsMap["controllers"] + ",-service"
@@ -367,37 +383,12 @@ func cloudControllerManager(ctx context.Context, cfg *config.Control) error {
 // If the CCM RBAC changes, the ResourceAttributes checked for by this function should
 // be modified to check for the most recently added privilege.
 func checkForCloudControllerPrivileges(ctx context.Context, runtime *config.ControlRuntime, timeout time.Duration) error {
-	restConfig, err := clientcmd.BuildConfigFromFlags("", runtime.KubeConfigAdmin)
-	if err != nil {
-		return err
-	}
-	authClient, err := authorizationv1client.NewForConfig(restConfig)
-	if err != nil {
-		return err
-	}
-	sar := &authorizationv1.SubjectAccessReview{
-		Spec: authorizationv1.SubjectAccessReviewSpec{
-			User: version.Program + "-cloud-controller-manager",
-			ResourceAttributes: &authorizationv1.ResourceAttributes{
-				Namespace: metav1.NamespaceSystem,
-				Verb:      "*",
-				Resource:  "daemonsets",
-				Group:     "apps",
-			},
-		},
-	}
-
-	err = wait.PollImmediate(time.Second, timeout, func() (bool, error) {
-		r, err := authClient.SubjectAccessReviews().Create(ctx, sar, metav1.CreateOptions{})
-		if err != nil {
-			return false, err
-		}
-		if r.Status.Allowed {
-			return true, nil
-		}
-		return false, nil
-	})
-	return err
+	return util.WaitForRBACReady(ctx, runtime.KubeConfigAdmin, timeout, authorizationv1.ResourceAttributes{
+		Namespace: metav1.NamespaceSystem,
+		Verb:      "watch",
+		Resource:  "endpointslices",
+		Group:     "discovery.k8s.io",
+	}, version.Program+"-cloud-controller-manager")
 }
 
 func waitForAPIServerHandlers(ctx context.Context, runtime *config.ControlRuntime) {

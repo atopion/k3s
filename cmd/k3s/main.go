@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -20,6 +22,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rancher/wrangler/pkg/resolvehome"
 	"github.com/sirupsen/logrus"
+	"github.com/spf13/pflag"
 	"github.com/urfave/cli"
 )
 
@@ -27,13 +30,14 @@ var criDefaultConfigPath = "/etc/crictl.yaml"
 
 // main entrypoint for the k3s multicall binary
 func main() {
-	dataDir := findDataDir()
+	dataDir := findDataDir(os.Args)
 
 	// Handle direct invocation via symlink alias (multicall binary behavior)
 	if runCLIs(dataDir) {
 		return
 	}
 
+	tokenCommand := internalCLIAction(version.Program+"-"+cmds.TokenCommand, dataDir, os.Args)
 	etcdsnapshotCommand := internalCLIAction(version.Program+"-"+cmds.EtcdSnapshotCommand, dataDir, os.Args)
 	secretsencryptCommand := internalCLIAction(version.Program+"-"+cmds.SecretsEncryptCommand, dataDir, os.Args)
 	certCommand := internalCLIAction(version.Program+"-"+cmds.CertCommand, dataDir, os.Args)
@@ -48,25 +52,31 @@ func main() {
 		cmds.NewCRICTL(externalCLIAction("crictl", dataDir)),
 		cmds.NewCtrCommand(externalCLIAction("ctr", dataDir)),
 		cmds.NewCheckConfigCommand(externalCLIAction("check-config", dataDir)),
-		cmds.NewEtcdSnapshotCommand(etcdsnapshotCommand,
-			cmds.NewEtcdSnapshotSubcommands(
-				etcdsnapshotCommand,
-				etcdsnapshotCommand,
-				etcdsnapshotCommand,
-				etcdsnapshotCommand),
+		cmds.NewTokenCommands(
+			tokenCommand,
+			tokenCommand,
+			tokenCommand,
+			tokenCommand,
 		),
-		cmds.NewSecretsEncryptCommand(secretsencryptCommand,
-			cmds.NewSecretsEncryptSubcommands(
-				secretsencryptCommand,
-				secretsencryptCommand,
-				secretsencryptCommand,
-				secretsencryptCommand,
-				secretsencryptCommand,
-				secretsencryptCommand),
+		cmds.NewEtcdSnapshotCommands(
+			etcdsnapshotCommand,
+			etcdsnapshotCommand,
+			etcdsnapshotCommand,
+			etcdsnapshotCommand,
+		),
+		cmds.NewSecretsEncryptCommands(
+			secretsencryptCommand,
+			secretsencryptCommand,
+			secretsencryptCommand,
+			secretsencryptCommand,
+			secretsencryptCommand,
+			secretsencryptCommand,
 		),
 		cmds.NewCertCommand(
 			cmds.NewCertSubcommands(
-				certCommand),
+				certCommand,
+				certCommand,
+			),
 		),
 		cmds.NewCompletionCommand(internalCLIAction(version.Program+"-completion", dataDir, os.Args)),
 	}
@@ -79,25 +89,41 @@ func main() {
 // findDataDir reads data-dir settings from the CLI args and config file.
 // If not found, the default will be used, which varies depending on whether
 // k3s is being run as root or not.
-func findDataDir() string {
-	for i, arg := range os.Args {
-		for _, flagName := range []string{"--data-dir", "-d"} {
-			if flagName == arg {
-				if len(os.Args) > i+1 {
-					return os.Args[i+1]
-				}
-			} else if strings.HasPrefix(arg, flagName+"=") {
-				return arg[len(flagName)+1:]
-			}
-		}
+func findDataDir(args []string) string {
+	var dataDir string
+	fs := pflag.NewFlagSet("data-dir-set", pflag.ContinueOnError)
+	fs.ParseErrorsWhitelist.UnknownFlags = true
+	fs.SetOutput(io.Discard)
+	fs.StringVarP(&dataDir, "data-dir", "d", "", "Data directory")
+	fs.Parse(args)
+	if dataDir != "" {
+		return dataDir
 	}
-	dataDir := configfilearg.MustFindString(os.Args, "data-dir")
+	dataDir = configfilearg.MustFindString(args, "data-dir")
 	if d, err := datadir.Resolve(dataDir); err == nil {
 		dataDir = d
 	} else {
 		logrus.Warnf("Failed to resolve user home directory: %s", err)
 	}
 	return dataDir
+}
+
+// findPreferBundledBin searches for prefer-bundled-bin from the config file, then CLI args.
+// we use pflag to process the args because we not yet parsed flags bound to the cli.Context
+func findPreferBundledBin(args []string) bool {
+	var preferBundledBin bool
+	fs := pflag.NewFlagSet("prefer-set", pflag.ContinueOnError)
+	fs.ParseErrorsWhitelist.UnknownFlags = true
+	fs.SetOutput(io.Discard)
+	fs.BoolVar(&preferBundledBin, "prefer-bundled-bin", false, "Prefer bundled binaries")
+
+	preferRes := configfilearg.MustFindString(args, "prefer-bundled-bin")
+	if preferRes != "" {
+		preferBundledBin, _ = strconv.ParseBool(preferRes)
+	}
+
+	fs.Parse(args)
+	return preferBundledBin
 }
 
 // runCLIs handles the case where the binary is being executed as a symlink alias,
@@ -158,7 +184,13 @@ func stageAndRun(dataDir, cmd string, args []string) error {
 	}
 	logrus.Debugf("Asset dir %s", dir)
 
-	if err := os.Setenv("PATH", filepath.Join(dir, "bin")+":"+os.Getenv("PATH")+":"+filepath.Join(dir, "bin/aux")); err != nil {
+	var pathEnv string
+	if findPreferBundledBin(args) {
+		pathEnv = filepath.Join(dir, "bin") + ":" + filepath.Join(dir, "bin/aux") + ":" + os.Getenv("PATH")
+	} else {
+		pathEnv = filepath.Join(dir, "bin") + ":" + os.Getenv("PATH") + ":" + filepath.Join(dir, "bin/aux")
+	}
+	if err := os.Setenv("PATH", pathEnv); err != nil {
 		return err
 	}
 	if err := os.Setenv(version.ProgramUpper+"_DATA_DIR", dir); err != nil {
@@ -172,7 +204,10 @@ func stageAndRun(dataDir, cmd string, args []string) error {
 
 	logrus.Debugf("Running %s %v", cmd, args)
 
-	return syscall.Exec(cmd, args, os.Environ())
+	if err := syscall.Exec(cmd, args, os.Environ()); err != nil {
+		return errors.Wrapf(err, "exec %s failed", cmd)
+	}
+	return nil
 }
 
 // getAssetAndDir returns the name of the bindata asset, along with a directory path

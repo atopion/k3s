@@ -1,3 +1,6 @@
+//go:build !no_cri_dockerd
+// +build !no_cri_dockerd
+
 package cridockerd
 
 import (
@@ -7,9 +10,13 @@ import (
 	"strings"
 
 	"github.com/Mirantis/cri-dockerd/cmd"
+	"github.com/Mirantis/cri-dockerd/cmd/version"
+
+	"github.com/k3s-io/k3s/pkg/agent/cri"
 	"github.com/k3s-io/k3s/pkg/cgroups"
 	"github.com/k3s-io/k3s/pkg/daemons/config"
 	"github.com/sirupsen/logrus"
+
 	utilsnet "k8s.io/utils/net"
 )
 
@@ -22,17 +29,18 @@ func Run(ctx context.Context, cfg *config.Node) error {
 	command := cmd.NewDockerCRICommand(ctx.Done())
 	command.SetArgs(args)
 	logrus.Infof("Running cri-dockerd %s", config.ArgString(args))
+	logrus.Infof("cri-dockerd version %s", version.FullVersion())
 
 	go func() {
 		defer func() {
 			if err := recover(); err != nil {
-				logrus.Fatalf("cri-dockerd panic: %s", debug.Stack())
+				logrus.WithField("stack", string(debug.Stack())).Fatalf("cri-dockerd panic: %v", err)
 			}
 		}()
 		logrus.Fatalf("cri-dockerd exited: %v", command.ExecuteContext(ctx))
 	}()
 
-	return nil
+	return cri.WaitForService(ctx, cfg.CRIDockerd.Address, "cri-dockerd")
 }
 
 func getDockerCRIArgs(cfg *config.Node) []string {

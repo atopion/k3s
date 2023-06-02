@@ -1,6 +1,7 @@
 package deps
 
 import (
+	"bytes"
 	"crypto"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
@@ -10,7 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 	"github.com/k3s-io/k3s/pkg/daemons/config"
 	"github.com/k3s-io/k3s/pkg/passwd"
 	"github.com/k3s-io/k3s/pkg/token"
+	"github.com/k3s-io/k3s/pkg/util"
 	"github.com/k3s-io/k3s/pkg/version"
 	certutil "github.com/rancher/dynamiclistener/cert"
 	"github.com/sirupsen/logrus"
@@ -31,6 +33,7 @@ import (
 	"k8s.io/apiserver/pkg/apis/apiserver"
 	apiserverconfigv1 "k8s.io/apiserver/pkg/apis/config/v1"
 	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/client-go/util/keyutil"
 )
 
 const (
@@ -110,6 +113,10 @@ func CreateRuntimeCertFiles(config *config.Control) {
 	runtime.ServiceKey = filepath.Join(config.DataDir, "tls", "service.key")
 	runtime.PasswdFile = filepath.Join(config.DataDir, "cred", "passwd")
 	runtime.NodePasswdFile = filepath.Join(config.DataDir, "cred", "node-passwd")
+
+	runtime.SigningClientCA = filepath.Join(config.DataDir, "tls", "client-ca.nochain.crt")
+	runtime.SigningServerCA = filepath.Join(config.DataDir, "tls", "server-ca.nochain.crt")
+	runtime.ServiceCurrentKey = filepath.Join(config.DataDir, "tls", "service.current.key")
 
 	runtime.KubeConfigAdmin = filepath.Join(config.DataDir, "cred", "admin.kubeconfig")
 	runtime.KubeConfigController = filepath.Join(config.DataDir, "cred", "controller.kubeconfig")
@@ -254,7 +261,7 @@ func genUsers(config *config.Control) error {
 func genEncryptedNetworkInfo(controlConfig *config.Control) error {
 	runtime := controlConfig.Runtime
 	if s, err := os.Stat(runtime.IPSECKey); err == nil && s.Size() > 0 {
-		psk, err := ioutil.ReadFile(runtime.IPSECKey)
+		psk, err := os.ReadFile(runtime.IPSECKey)
 		if err != nil {
 			return err
 		}
@@ -268,7 +275,7 @@ func genEncryptedNetworkInfo(controlConfig *config.Control) error {
 	}
 
 	controlConfig.IPSECPSK = psk
-	return ioutil.WriteFile(runtime.IPSECKey, []byte(psk+"\n"), 0600)
+	return os.WriteFile(runtime.IPSECKey, []byte(psk+"\n"), 0600)
 }
 
 func getServerPass(passwd *passwd.Passwd, config *config.Control) (string, error) {
@@ -313,6 +320,18 @@ func genClientCerts(config *config.Control) error {
 	runtime := config.Runtime
 	regen, err := createSigningCertKey(version.Program+"-client", runtime.ClientCA, runtime.ClientCAKey)
 	if err != nil {
+		return err
+	}
+
+	certs, err := certutil.CertsFromFile(runtime.ClientCA)
+	if err != nil {
+		return err
+	}
+
+	// If our CA certs are signed by a root or intermediate CA, ClientCA will contain a chain.
+	// The controller-manager's signer wants just a single cert, not a full chain; so create a file
+	// that is guaranteed to contain only a single certificate.
+	if err := certutil.WriteCert(runtime.SigningClientCA, certutil.EncodeCertPEM(certs[0])); err != nil {
 		return err
 	}
 
@@ -487,7 +506,24 @@ func createServerSigningCertKey(config *config.Control) (bool, error) {
 		}
 		return true, nil
 	}
-	return createSigningCertKey(version.Program+"-server", runtime.ServerCA, runtime.ServerCAKey)
+	regen, err := createSigningCertKey(version.Program+"-server", runtime.ServerCA, runtime.ServerCAKey)
+	if err != nil {
+		return regen, err
+	}
+
+	// If our CA certs are signed by a root or intermediate CA, ServerCA will contain a chain.
+	// The controller-manager's signer wants just a single cert, not a full chain; so create a file
+	// that is guaranteed to contain only a single certificate.
+	certs, err := certutil.CertsFromFile(runtime.ServerCA)
+	if err != nil {
+		return regen, err
+	}
+
+	if err := certutil.WriteCert(runtime.SigningServerCA, certutil.EncodeCertPEM(certs[0])); err != nil {
+		return regen, err
+	}
+
+	return regen, nil
 }
 
 func addSANs(altNames *certutil.AltNames, sans []string) {
@@ -539,22 +575,7 @@ func fieldsChanged(certFile string, commonName string, organization []string, sa
 		return false
 	}
 
-	verifyOpts := x509.VerifyOptions{
-		Roots: x509.NewCertPool(),
-		KeyUsages: []x509.ExtKeyUsage{
-			x509.ExtKeyUsageAny,
-		},
-	}
-
-	for _, cert := range caCertificates {
-		verifyOpts.Roots.AddCert(cert)
-	}
-
-	if _, err := certificates[0].Verify(verifyOpts); err != nil {
-		return true
-	}
-
-	return false
+	return !bytes.Equal(certificates[0].AuthorityKeyId, caCertificates[0].SubjectKeyId)
 }
 
 func createClientCertKey(regen bool, commonName string, organization []string, altNames *certutil.AltNames, extKeyUsage []x509.ExtKeyUsage, caCertFile, caKeyFile, certFile, keyFile string) (bool, error) {
@@ -572,7 +593,7 @@ func createClientCertKey(regen bool, commonName string, organization []string, a
 		return false, err
 	}
 
-	caCert, err := certutil.CertsFromFile(caCertFile)
+	caCerts, err := certutil.CertsFromFile(caCertFile)
 	if err != nil {
 		return false, err
 	}
@@ -595,12 +616,12 @@ func createClientCertKey(regen bool, commonName string, organization []string, a
 	if altNames != nil {
 		cfg.AltNames = *altNames
 	}
-	cert, err := certutil.NewSignedCert(cfg, key.(crypto.Signer), caCert[0], caKey.(crypto.Signer))
+	cert, err := certutil.NewSignedCert(cfg, key.(crypto.Signer), caCerts[0], caKey.(crypto.Signer))
 	if err != nil {
 		return false, err
 	}
 
-	return true, certutil.WriteCert(certFile, append(certutil.EncodeCertPEM(cert), certutil.EncodeCertPEM(caCert[0])...))
+	return true, certutil.WriteCert(certFile, util.EncodeCertsPEM(cert, caCerts))
 }
 
 func exists(files ...string) bool {
@@ -613,17 +634,35 @@ func exists(files ...string) bool {
 }
 
 func genServiceAccount(runtime *config.ControlRuntime) error {
-	_, keyErr := os.Stat(runtime.ServiceKey)
-	if keyErr == nil {
-		return nil
+	if _, err := os.Stat(runtime.ServiceKey); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		key, err := certutil.NewPrivateKey()
+		if err != nil {
+			return err
+		}
+		if err := certutil.WriteKey(runtime.ServiceKey, certutil.EncodePrivateKeyPEM(key)); err != nil {
+			return err
+		}
 	}
 
-	key, err := certutil.NewPrivateKey()
+	// When rotating the ServiceAccount signing key, it is necessary to keep the old keys in ServiceKey so that
+	// old ServiceAccount tokens can be validated during the switchover process. The first key in the file
+	// should be the current key used to sign ServiceAccount tokens; others are old keys used for verification
+	// only. Create a file containing just the first key in the list, which will be used to configure the
+	// signing controller.
+	key, err := keyutil.PrivateKeyFromFile(runtime.ServiceKey)
 	if err != nil {
 		return err
 	}
 
-	return certutil.WriteKey(runtime.ServiceKey, certutil.EncodePrivateKeyPEM(key))
+	keyData, err := keyutil.MarshalPrivateKeyToPEM(key)
+	if err != nil {
+		return err
+	}
+
+	return certutil.WriteKey(runtime.ServiceCurrentKey, keyData)
 }
 
 func createSigningCertKey(prefix, certFile, keyFile string) (bool, error) {
@@ -672,13 +711,13 @@ func genEncryptionConfigAndState(controlConfig *config.Control) error {
 	if s, err := os.Stat(runtime.EncryptionConfig); err == nil && s.Size() > 0 {
 		// On upgrade from older versions, the encryption hash may not exist, create it
 		if _, err := os.Stat(runtime.EncryptionHash); errors.Is(err, os.ErrNotExist) {
-			curEncryptionByte, err := ioutil.ReadFile(runtime.EncryptionConfig)
+			curEncryptionByte, err := os.ReadFile(runtime.EncryptionConfig)
 			if err != nil {
 				return err
 			}
 			encryptionConfigHash := sha256.Sum256(curEncryptionByte)
 			ann := "start-" + hex.EncodeToString(encryptionConfigHash[:])
-			return ioutil.WriteFile(controlConfig.Runtime.EncryptionHash, []byte(ann), 0600)
+			return os.WriteFile(controlConfig.Runtime.EncryptionHash, []byte(ann), 0600)
 		}
 		return nil
 	}
@@ -720,12 +759,12 @@ func genEncryptionConfigAndState(controlConfig *config.Control) error {
 	if err != nil {
 		return err
 	}
-	if err := ioutil.WriteFile(runtime.EncryptionConfig, b, 0600); err != nil {
+	if err := os.WriteFile(runtime.EncryptionConfig, b, 0600); err != nil {
 		return err
 	}
 	encryptionConfigHash := sha256.Sum256(b)
 	ann := "start-" + hex.EncodeToString(encryptionConfigHash[:])
-	return ioutil.WriteFile(controlConfig.Runtime.EncryptionHash, []byte(ann), 0600)
+	return os.WriteFile(controlConfig.Runtime.EncryptionHash, []byte(ann), 0600)
 }
 
 func genEgressSelectorConfig(controlConfig *config.Control) error {
@@ -768,7 +807,7 @@ func genEgressSelectorConfig(controlConfig *config.Control) error {
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(controlConfig.Runtime.EgressSelectorConfig, b, 0600)
+	return os.WriteFile(controlConfig.Runtime.EgressSelectorConfig, b, 0600)
 }
 
 func genCloudConfig(controlConfig *config.Control) error {
@@ -786,6 +825,6 @@ func genCloudConfig(controlConfig *config.Control) error {
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(controlConfig.Runtime.CloudControllerConfig, b, 0600)
+	return os.WriteFile(controlConfig.Runtime.CloudControllerConfig, b, 0600)
 
 }

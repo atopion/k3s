@@ -3,8 +3,8 @@ package terraform
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -13,6 +13,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 )
+
+var config *ssh.ClientConfig
 
 type Node struct {
 	Name       string
@@ -33,11 +35,6 @@ type Pod struct {
 	Node      string
 }
 
-var config *ssh.ClientConfig
-var SSHKEY string
-var SSHUSER string
-var err error
-
 func GetBasepath() string {
 	_, b, _, _ := runtime.Caller(0)
 	return filepath.Join(filepath.Dir(b), "../..")
@@ -50,7 +47,7 @@ func checkError(e error) {
 }
 
 func publicKey(path string) ssh.AuthMethod {
-	key, err := ioutil.ReadFile(path)
+	key, err := os.ReadFile(path)
 	if err != nil {
 		panic(err)
 	}
@@ -91,10 +88,6 @@ func runsshCommand(cmd string, conn *ssh.Client) (string, error) {
 	return fmt.Sprintf("%s", stdoutBuf.String()), err
 }
 
-// nodeOs: ubuntu centos7 centos8 sles15
-// clusterType arm, etcd externaldb, if external_db var is not "" picks database from the vars file,
-// resourceName: name to resource created timestamp attached
-
 // RunCmdOnNode executes a command from within the given node
 func RunCmdOnNode(cmd string, ServerIP string, SSHUser string, SSHKey string) (string, error) {
 	Server := ServerIP + ":22"
@@ -122,12 +115,13 @@ func CountOfStringInSlice(str string, pods []Pod) int {
 	return count
 }
 
+// DeployWorkload deploys the workloads on the cluster from resource manifest files
 func DeployWorkload(workload, kubeconfig string, arch string) (string, error) {
 	resourceDir := GetBasepath() + "/tests/terraform/amd64_resource_files"
 	if arch == "arm64" {
 		resourceDir = GetBasepath() + "/tests/terraform/arm_resource_files"
 	}
-	files, err := ioutil.ReadDir(resourceDir)
+	files, err := os.ReadDir(resourceDir)
 	if err != nil {
 		err = fmt.Errorf("%s : Unable to read resource manifest file for %s", err, workload)
 		return "", err
@@ -172,6 +166,8 @@ func FetchIngressIP(kubeconfig string) ([]string, error) {
 	return ingressIPs, nil
 }
 
+// ParseNodes parses the nodes from the kubectl get nodes command
+// and returns a list of nodes
 func ParseNodes(kubeConfig string, print bool) ([]Node, error) {
 	nodes := make([]Node, 0, 10)
 	nodeList := ""
@@ -204,6 +200,8 @@ func ParseNodes(kubeConfig string, print bool) ([]Node, error) {
 	return nodes, nil
 }
 
+// ParsePods parses the pods from the kubectl get pods command
+// and returns a list of pods
 func ParsePods(kubeconfig string, print bool) ([]Pod, error) {
 	pods := make([]Pod, 0, 10)
 	podList := ""
@@ -231,4 +229,16 @@ func ParsePods(kubeconfig string, print bool) ([]Pod, error) {
 		fmt.Println(podList)
 	}
 	return pods, nil
+}
+
+func PrintFileContents(f ...string) error {
+	for _, file := range f {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(content) + "\n")
+	}
+
+	return nil
 }

@@ -14,16 +14,17 @@ import (
 
 // Valid nodeOS:
 // generic/ubuntu2004, generic/centos7, generic/rocky8
-// opensuse/Leap-15.3.x86_64, dweomer/microos.amd64
+// opensuse/Leap-15.3.x86_64
 var nodeOS = flag.String("nodeOS", "generic/ubuntu2004", "VM operating system")
 var serverCount = flag.Int("serverCount", 3, "number of server nodes")
 var agentCount = flag.Int("agentCount", 2, "number of agent nodes")
 var hardened = flag.Bool("hardened", false, "true or false")
 var ci = flag.Bool("ci", false, "running on CI")
+var local = flag.Bool("local", false, "Controls which version k3s upgrades too, local binary or latest commit on master")
 
 // Environment Variables Info:
 // E2E_REGISTRY: true/false (default: false)
-// Controls which K3s version is installed first, upgrade is always to latest commit
+// Controls which K3s version is installed first
 // E2E_RELEASE_VERSION=v1.23.3+k3s1
 // OR
 // E2E_RELEASE_CHANNEL=(commit|latest|stable), commit pulls latest commit from master
@@ -31,7 +32,8 @@ var ci = flag.Bool("ci", false, "running on CI")
 func Test_E2EUpgradeValidation(t *testing.T) {
 	RegisterFailHandler(Fail)
 	flag.Parse()
-	RunSpecs(t, "Create Cluster Test Suite")
+	suiteConfig, reporterConfig := GinkgoConfiguration()
+	RunSpecs(t, "Upgrade Cluster Test Suite", suiteConfig, reporterConfig)
 }
 
 var (
@@ -40,12 +42,14 @@ var (
 	agentNodeNames  []string
 )
 
+var _ = ReportAfterEach(e2e.GenReport)
+
 var _ = Describe("Verify Upgrade", Ordered, func() {
 	Context("Cluster :", func() {
 		It("Starts up with no issues", func() {
 			var err error
 			serverNodeNames, agentNodeNames, err = e2e.CreateCluster(*nodeOS, *serverCount, *agentCount)
-			Expect(err).NotTo(HaveOccurred(), e2e.GetVagrantLog())
+			Expect(err).NotTo(HaveOccurred(), e2e.GetVagrantLog(err))
 			fmt.Println("CLUSTER CONFIG")
 			fmt.Println("OS:", *nodeOS)
 			fmt.Println("Server Nodes:", serverNodeNames)
@@ -62,7 +66,7 @@ var _ = Describe("Verify Upgrade", Ordered, func() {
 				for _, node := range nodes {
 					g.Expect(node.Status).Should(Equal("Ready"))
 				}
-			}, "420s", "5s").Should(Succeed())
+			}, "620s", "5s").Should(Succeed())
 			_, _ = e2e.ParseNodes(kubeConfigFile, true)
 
 			fmt.Printf("\nFetching Pods status\n")
@@ -76,7 +80,7 @@ var _ = Describe("Verify Upgrade", Ordered, func() {
 						g.Expect(pod.Status).Should(Equal("Running"), pod.Name)
 					}
 				}
-			}, "420s", "5s").Should(Succeed())
+			}, "620s", "5s").Should(Succeed())
 			_, _ = e2e.ParsePods(kubeConfigFile, true)
 		})
 
@@ -246,9 +250,8 @@ var _ = Describe("Verify Upgrade", Ordered, func() {
 
 		It("Upgrades with no issues", func() {
 			var err error
-			err = e2e.UpgradeCluster(serverNodeNames, agentNodeNames)
-			fmt.Println(err)
-			Expect(err).NotTo(HaveOccurred())
+			Expect(e2e.UpgradeCluster(append(serverNodeNames, agentNodeNames...), *local)).To(Succeed())
+			Expect(e2e.RestartCluster(append(serverNodeNames, agentNodeNames...))).To(Succeed())
 			fmt.Println("CLUSTER UPGRADED")
 			kubeConfigFile, err = e2e.GenKubeConfigFile(serverNodeNames[0])
 			Expect(err).NotTo(HaveOccurred())
@@ -376,7 +379,7 @@ var _ = Describe("Verify Upgrade", Ordered, func() {
 	})
 })
 
-var failed = false
+var failed bool
 var _ = AfterEach(func() {
 	failed = failed || CurrentSpecReport().Failed()
 })

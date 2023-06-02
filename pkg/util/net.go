@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	apinet "k8s.io/apimachinery/pkg/util/net"
 )
@@ -189,6 +190,19 @@ func ParseStringSliceToIPs(s cli.StringSlice) ([]net.IP, error) {
 	return ips, nil
 }
 
+// GetFirstValidIPString returns the first valid address from a list of IP address strings,
+// without preference for IP family. If no address are found, an empty string is returned.
+func GetFirstValidIPString(s cli.StringSlice) string {
+	for _, unparsedIP := range s {
+		for _, v := range strings.Split(unparsedIP, ",") {
+			if ip := net.ParseIP(v); ip != nil {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
 // GetFirstIP returns the first IPv4 address from the list of IP addresses.
 // If no IPv4 addresses are found, returns the first IPv6 address
 // if neither of IPv4 or IPv6 are found an error is raised.
@@ -285,4 +299,62 @@ func IPStringToIPNet(address string) (*net.IPNet, error) {
 	}
 	_, cidr, err := net.ParseCIDR(address)
 	return cidr, err
+}
+
+// GetIPFromInterface is the public function that returns the IP of an interface
+func GetIPFromInterface(ifaceName string) string {
+	ip, err := getIPFromInterface(ifaceName)
+	if err != nil {
+		logrus.Warn(fmt.Errorf("unable to get global unicast ip from interface name: %w", err))
+	} else {
+		logrus.Infof("Found ip %s from iface %s", ip, ifaceName)
+	}
+	return ip
+}
+
+// getIPFromInterface is the private function that returns de IP of an interface
+func getIPFromInterface(ifaceName string) (string, error) {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return "", err
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return "", err
+	}
+	if iface.Flags&net.FlagUp == 0 {
+		return "", fmt.Errorf("the interface %s is not up", ifaceName)
+	}
+
+	globalUnicasts := []string{}
+	globalUnicastsIPv6 := []string{}
+	for _, addr := range addrs {
+		ip, _, err := net.ParseCIDR(addr.String())
+		if err != nil {
+			return "", fmt.Errorf("unable to parse CIDR for interface %s: %w", iface.Name, err)
+		}
+		// if not IPv4 adding it on IPv6 list
+		if ip.To4() == nil {
+			if ip.IsGlobalUnicast() {
+				globalUnicastsIPv6 = append(globalUnicastsIPv6, ip.String())
+			}
+			continue
+		}
+		if ip.IsGlobalUnicast() {
+			globalUnicasts = append(globalUnicasts, ip.String())
+		}
+	}
+
+	if len(globalUnicasts) > 1 {
+		return "", fmt.Errorf("multiple global unicast addresses defined for %s, please set ip from one of %v", ifaceName, globalUnicasts)
+	}
+	if len(globalUnicasts) == 1 && len(globalUnicastsIPv6) == 0 {
+		return globalUnicasts[0], nil
+	} else if len(globalUnicastsIPv6) > 0 && len(globalUnicasts) == 1 {
+		return globalUnicasts[0] + "," + globalUnicastsIPv6[0], nil
+	} else if len(globalUnicastsIPv6) > 0 {
+		return globalUnicastsIPv6[0], nil
+	}
+
+	return "", fmt.Errorf("can't find ip for interface %s", ifaceName)
 }

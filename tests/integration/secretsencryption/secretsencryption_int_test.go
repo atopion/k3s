@@ -68,12 +68,13 @@ var _ = Describe("secrets encryption rotation", Ordered, func() {
 			Eventually(func() error {
 				return testutil.K3sDefaultDeployments()
 			}, "180s", "5s").Should(Succeed())
+			Eventually(func() (string, error) {
+				return testutil.K3sCmd("secrets-encrypt status -d", secretsEncryptionDataDir)
+			}, "30s", "5s").Should(ContainSubstring("Current Rotation Stage: prepare"))
 		})
 		It("rotates the keys", func() {
-			Eventually(func() (string, error) {
-				return testutil.K3sCmd("secrets-encrypt rotate -d", secretsEncryptionDataDir)
-			}, "10s", "2s").Should(ContainSubstring("rotate completed successfully"))
-
+			Expect(testutil.K3sCmd("secrets-encrypt rotate -d", secretsEncryptionDataDir)).
+				To(ContainSubstring("rotate completed successfully"))
 			result, err := testutil.K3sCmd("secrets-encrypt status -d", secretsEncryptionDataDir)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result).To(ContainSubstring("Current Rotation Stage: rotate"))
@@ -140,10 +141,15 @@ var _ = Describe("secrets encryption rotation", Ordered, func() {
 	})
 })
 
+var failed bool
+var _ = AfterEach(func() {
+	failed = failed || CurrentSpecReport().Failed()
+})
+
 var _ = AfterSuite(func() {
 	if !testutil.IsExistingServer() {
-		if CurrentSpecReport().Failed() {
-			testutil.K3sDumpLog(secretsEncryptionServer)
+		if failed {
+			testutil.K3sSaveLog(secretsEncryptionServer, false)
 		}
 		Expect(testutil.K3sKillServer(secretsEncryptionServer)).To(Succeed())
 		Expect(testutil.K3sCleanup(testLock, secretsEncryptionDataDir)).To(Succeed())

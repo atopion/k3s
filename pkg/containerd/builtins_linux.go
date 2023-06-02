@@ -20,8 +20,9 @@
 package containerd
 
 import (
+	_ "github.com/containerd/containerd/metrics"
 	_ "github.com/containerd/containerd/metrics/cgroups"
-	_ "github.com/containerd/containerd/runtime/v2"
+	_ "github.com/containerd/containerd/metrics/cgroups/v2"
 	_ "github.com/containerd/containerd/runtime/v2/runc/options"
 	_ "github.com/containerd/containerd/snapshots/btrfs/plugin"
 	_ "github.com/containerd/containerd/snapshots/native/plugin"

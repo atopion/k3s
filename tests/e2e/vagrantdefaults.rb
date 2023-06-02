@@ -34,6 +34,41 @@ def getInstallType(vm, release_version, branch)
   end
 end
 
+def getHardenedArg(vm, hardened, scripts_location)
+  if hardened.empty? 
+    return ""
+  end
+  hardened_arg = <<~HARD
+    protect-kernel-defaults: true
+    secrets-encryption: true
+    kube-controller-manager-arg:
+      - 'terminated-pod-gc-threshold=10'
+      - 'use-service-account-credentials=true'
+    kubelet-arg:
+      - 'streaming-connection-idle-timeout=5m'
+      - 'make-iptables-util-chains=true'
+      - 'event-qps=0'
+    kube-apiserver-arg:
+      - 'audit-log-path=/var/lib/rancher/k3s/server/logs/audit.log'
+      - 'audit-policy-file=/var/lib/rancher/k3s/server/audit.yaml'
+      - 'audit-log-maxage=30'
+      - 'audit-log-maxbackup=10'
+      - 'audit-log-maxsize=100'
+      - 'service-account-lookup=true'
+  HARD
+  if hardened == "psp"
+    vm.provision "Set kernel parameters", type: "shell", path: scripts_location + "/harden.sh"
+    hardened_arg += "  - 'enable-admission-plugins=NodeRestriction,NamespaceLifecycle,ServiceAccount,PodSecurityPolicy'"
+  elsif hardened == "psa"
+    vm.provision "Set kernel parameters", type: "shell", path: scripts_location + "/harden.sh", args: [ "psa" ]
+    hardened_arg += "  - 'admission-control-config-file=/var/lib/rancher/k3s/server/psa.yaml'"
+  else 
+    puts "Invalid E2E_HARDENED option"
+    exit 1
+  end
+  return hardened_arg
+end
+
 def dockerInstall(vm)
   vm.provider "libvirt" do |v|
     v.memory = NODE_MEMORY + 1024
@@ -41,15 +76,17 @@ def dockerInstall(vm)
   vm.provider "virtualbox" do |v|
     v.memory = NODE_MEMORY + 1024
   end
-  if vm.box.to_s.include?("ubuntu")
+  box = vm.box.to_s
+  if box.include?("ubuntu")
     vm.provision "shell", inline: "apt update; apt install -y docker.io"
-  end
-  if vm.box.to_s.include?("Leap")
+  elsif box.include?("Leap")
     vm.provision "shell", inline: "zypper install -y docker apparmor-parser"
-  end
-  if vm.box.to_s.include?("microos")
+  elsif box.include?("microos")
     vm.provision "shell", inline: "transactional-update pkg install -y docker apparmor-parser"
     vm.provision 'docker-reload', type: 'reload', run: 'once'
     vm.provision "shell", inline: "systemctl enable --now docker"
+  elsif box.include?("rocky8") || box.include?("rocky9")
+    vm.provision "shell", inline: "dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo"
+    vm.provision "shell", inline: "dnf install -y docker-ce"
   end
 end

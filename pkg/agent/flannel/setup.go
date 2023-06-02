@@ -4,13 +4,11 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/k3s-io/k3s/pkg/agent/util"
 	"github.com/k3s-io/k3s/pkg/daemons/config"
-	"github.com/k3s-io/k3s/pkg/version"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
@@ -42,6 +40,12 @@ const (
       "capabilities":{
         "portMappings":true
       }
+    },
+    {
+      "type":"bandwidth",
+      "capabilities":{
+        "bandwidth":true
+      }
     }
   ]
 }
@@ -68,15 +72,6 @@ const (
 	"Type": "ipsec",
 	"UDPEncap": true,
 	"PSK": "%psk%"
-}`
-
-	wireguardBackend = `{
-	"Type": "extension",
-	"PreStartupCommand": "wg genkey | tee %flannelConfDir%/privatekey | wg pubkey",
-	"PostStartupCommand": "export SUBNET_IP=$(echo $SUBNET | cut -d'/' -f 1); ip link del flannel.1 2>/dev/null; echo $PATH >&2; wg-add.sh flannel.1 && wg set flannel.1 listen-port 51820 private-key %flannelConfDir%/privatekey && ip addr add $SUBNET_IP/32 dev flannel.1 && ip link set flannel.1 up && ip route add $NETWORK dev flannel.1",
-	"ShutdownCommand": "ip link del flannel.1",
-	"SubnetAddCommand": "read PUBLICKEY; wg set flannel.1 peer $PUBLICKEY endpoint $PUBLIC_IP:51820 allowed-ips $SUBNET persistent-keepalive 25",
-	"SubnetRemoveCommand": "read PUBLICKEY; wg set flannel.1 peer $PUBLICKEY remove"
 }`
 
 	wireguardNativeBackend = `{
@@ -110,7 +105,7 @@ func Run(ctx context.Context, nodeConfig *config.Node, nodes typedcorev1.NodeInt
 		return errors.Wrap(err, "failed to check netMode for flannel")
 	}
 	go func() {
-		err := flannel(ctx, nodeConfig.FlannelIface, nodeConfig.FlannelConfFile, nodeConfig.AgentConfig.KubeConfigKubelet, nodeConfig.FlannelIPv6Masq, netMode)
+		err := flannel(ctx, nodeConfig.FlannelIface, nodeConfig.FlannelConfFile, nodeConfig.AgentConfig.KubeConfigKubelet, nodeConfig.FlannelIPv6Masq, nodeConfig.MultiClusterCIDR, netMode)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			logrus.Fatalf("flannel exited: %v", err)
 		}
@@ -211,16 +206,7 @@ func createFlannelConf(nodeConfig *config.Node) error {
 	backend := parts[0]
 	backendOptions := make(map[string]string)
 	if len(parts) > 1 {
-		logrus.Warnf("The additional options through flannel-backend are deprecated and will be removed in k3s v1.27, use flannel-conf instead")
-		options := strings.Split(parts[1], ",")
-		for _, o := range options {
-			p := strings.SplitN(o, "=", 2)
-			if len(p) == 1 {
-				backendOptions[p[0]] = ""
-			} else {
-				backendOptions[p[0]] = p[1]
-			}
-		}
+		logrus.Fatalf("The additional options through flannel-backend are deprecated and were removed in k3s v1.27, use flannel-conf instead")
 	}
 
 	switch backend {
@@ -229,13 +215,7 @@ func createFlannelConf(nodeConfig *config.Node) error {
 	case config.FlannelBackendHostGW:
 		backendConf = hostGWBackend
 	case config.FlannelBackendIPSEC:
-		backendConf = strings.ReplaceAll(ipsecBackend, "%psk%", nodeConfig.AgentConfig.IPSECPSK)
-		if err := setupStrongSwan(nodeConfig); err != nil {
-			return err
-		}
-	case config.FlannelBackendWireguard:
-		backendConf = strings.ReplaceAll(wireguardBackend, "%flannelConfDir%", filepath.Dir(nodeConfig.FlannelConfFile))
-		logrus.Warnf("The wireguard backend is deprecated and will be removed in k3s v1.26, please switch to wireguard-native. Check our docs for information about how to migrate")
+		logrus.Fatal("The ipsec backend is deprecated and was removed in k3s v1.27; please switch to wireguard-native. Check our docs for information on how to migrate.")
 	case config.FlannelBackendWireguardNative:
 		mode, ok := backendOptions["Mode"]
 		if !ok {
@@ -254,34 +234,6 @@ func createFlannelConf(nodeConfig *config.Node) error {
 
 	logrus.Debugf("The flannel configuration is %s", confJSON)
 	return util.WriteFile(nodeConfig.FlannelConfFile, confJSON)
-}
-
-func setupStrongSwan(nodeConfig *config.Node) error {
-	// if data dir env is not set point to root
-	dataDir := os.Getenv(version.ProgramUpper + "_DATA_DIR")
-	if dataDir == "" {
-		dataDir = "/"
-	}
-	dataDir = filepath.Join(dataDir, "etc", "strongswan")
-
-	info, err := os.Lstat(nodeConfig.AgentConfig.StrongSwanDir)
-	// something exists but is not a symlink, return
-	if err == nil && info.Mode()&os.ModeSymlink == 0 {
-		return nil
-	}
-	if err == nil {
-		target, err := os.Readlink(nodeConfig.AgentConfig.StrongSwanDir)
-		// current link is the same, return
-		if err == nil && target == dataDir {
-			return nil
-		}
-	}
-
-	// clean up strongswan old link
-	os.Remove(nodeConfig.AgentConfig.StrongSwanDir)
-
-	// make new strongswan link
-	return os.Symlink(dataDir, nodeConfig.AgentConfig.StrongSwanDir)
 }
 
 // fundNetMode returns the mode (ipv4, ipv6 or dual-stack) in which flannel is operating
