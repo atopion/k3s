@@ -137,6 +137,7 @@ type Agent struct {
 	VModule                 string
 	LogFile                 string
 	AlsoLogToStderr         bool
+	NoPivotRoot             bool
 }
 
 // CriticalControlArgs contains parameters that all control plane nodes in HA must share

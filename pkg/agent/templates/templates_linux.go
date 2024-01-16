@@ -94,6 +94,7 @@ enable_keychain = true
 
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
   SystemdCgroup = {{ .SystemdCgroup }}
+  NoPivotRoot = {{ .NoPivotRoot }}
 
 [plugins."io.containerd.grpc.v1.cri".registry]
   config_path = "{{ .NodeConfig.Containerd.Registry }}"

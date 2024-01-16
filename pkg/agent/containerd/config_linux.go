@@ -64,6 +64,7 @@ func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
 		NodeConfig:            cfg,
 		DisableCgroup:         disableCgroup,
 		SystemdCgroup:         cfg.AgentConfig.Systemd,
+		NoPivotRoot:           cfg.AgentConfig.NoPivotRoot,
 		IsRunningInUserNS:     isRunningInUserNS,
 		EnableUnprivileged:    kernel.CheckKernelVersion(4, 11, 0),
 		PrivateRegistryConfig: cfg.AgentConfig.Registry,
