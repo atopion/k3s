@@ -538,6 +538,7 @@ var ServerFlags = []cli.Flag{
 		Destination: &ServerConfig.Rootless,
 	},
 	PreferBundledBin,
+	NoPivotRootFlag,
 	SELinuxFlag,
 	LBServerPortFlag,
 

@@ -34,6 +34,7 @@ func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
 		NodeConfig:            cfg,
 		DisableCgroup:         true,
 		SystemdCgroup:         false,
+		NoPivotRoot:           false,
 		IsRunningInUserNS:     false,
 		PrivateRegistryConfig: cfg.AgentConfig.Registry,
 		NoDefaultEndpoint:     cfg.Containerd.NoDefault,
